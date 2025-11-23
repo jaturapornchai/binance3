@@ -1,0 +1,9 @@
+# Secrets
+config.py
+.env
+
+# Data
+*.csv
+__pycache__/
+*.pyc
+.DS_Store

@@ -1,0 +1,15 @@
+# Project Rules & Guidelines
+
+## 1. Language & Communication
+- **Primary Language:** Thai (ภาษาไทย)
+- **Style:** Concise, Direct, No fluff.
+- **Technical Terms:** Use English for trading terms (e.g., Trend, Breakout, Stop Loss).
+
+## 2. Trading Objectives
+- **Asset:** BTCUSDT (Binance Futures)
+- **Goal:** > 20% Return in 30 days.
+- **Fee Structure:** 0.04% (Taker) or 0.2% (High Fee).
+- **Leverage:** 5x
+- **Timeframe:** 1h
+- **Data:** 365 days historical data.
+- **Backtesting:** Strict fee calculation required.
