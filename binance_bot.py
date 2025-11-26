@@ -5,6 +5,15 @@ import time
 import config
 from datetime import datetime
 import sys
+import builtins
+
+# Force unbuffered output for Docker logs
+sys.stdout.reconfigure(line_buffering=True)
+
+# Override print to always flush
+def print(*args, **kwargs):
+    kwargs['flush'] = True
+    builtins.print(*args, **kwargs)
 
 class BinanceBot:
     def __init__(self):
@@ -27,6 +36,7 @@ class BinanceBot:
         
         # Initialize
         self.check_connection()
+        self.check_position_mode()
         self.set_leverage()
 
     def check_connection(self):
@@ -36,6 +46,17 @@ class BinanceBot:
         except Exception as e:
             print(f"❌ Connection Error: {e}")
             sys.exit(1)
+
+    def check_position_mode(self):
+        try:
+            # Check if in Hedge Mode or One-Way Mode
+            response = self.exchange.fapiPrivateGetPositionSideDual()
+            if response['dualSidePosition']:
+                print("⚠️ Account is in HEDGE Mode (Long/Short separate)")
+            else:
+                print("✅ Account is in ONE-WAY Mode")
+        except Exception as e:
+            print(f"⚠️ Could not check position mode: {e}")
 
     def set_leverage(self):
         try:
@@ -138,29 +159,22 @@ class BinanceBot:
             print(f"⚠️ Error fetching position: {e}")
             return None, 0, 0
 
-    def execute_trade(self, signal, close_price, atr):
+    def execute_trade(self, signal, close_price, sl_price, tp_price):
         balance = self.exchange.fetch_balance()['USDT']['free']
-        risk_amt = balance * config.RISK_PER_TRADE
         
-        # Calculate Position Size
-        # Stop Loss Distance
-        sl_dist = atr * 2.0
+        # Fixed Position Size: $500 Margin
+        margin_amount = 500.0
         
-        # Size = Risk Amount / SL Distance
-        # Example: Risk $100. SL Dist $500. Size = 0.2 BTC.
-        # However, with leverage, we need to be careful.
-        # Simplified: Use % of balance with leverage.
-        
-        # Let's stick to the backtest logic:
-        # We want to risk X% of equity.
-        # But for simplicity in this bot version, let's use a fixed size logic or simple leverage calculation.
-        # Position Value = Balance * Leverage (Full degen? No, let's be safe)
-        # Let's use: Position Value = Balance * 0.5 * Leverage (Use half available margin)
-        
-        position_value = balance * 0.90 * self.leverage # Use 90% of balance
+        # Check if we have enough balance
+        if balance < margin_amount:
+            print(f"⚠️ Insufficient balance ({balance:.2f} USDT) for $500 margin trade. Using 90% of balance instead.")
+            margin_amount = balance * 0.90
+            
+        # Position Value = Margin * Leverage
+        position_value = margin_amount * self.leverage 
         amount = position_value / close_price
         
-        print(f"🚀 Executing {signal.upper()} | Price: {close_price} | Amount: {amount:.4f}")
+        print(f"🚀 Executing {signal.upper()} | Margin: ${margin_amount:.2f} | Lev: {self.leverage}x | Size: {amount:.4f} BTC")
         
         try:
             if signal == 'long':
@@ -169,9 +183,8 @@ class BinanceBot:
                 print(f"✅ BUY Order Filled: {order['id']}")
                 
                 # Set TP/SL
-                entry_price = float(order['average']) if order['average'] else close_price
-                sl_price = entry_price - sl_dist
-                tp_price = entry_price + (sl_dist * config.RISK_REWARD_RATIO)
+                # entry_price = float(order['average']) if order['average'] else close_price
+                # Use calculated SL/TP directly
                 
                 # Binance Futures requires specific params for TP/SL orders
                 # Stop Loss
@@ -192,9 +205,7 @@ class BinanceBot:
                 print(f"✅ SELL Order Filled: {order['id']}")
                 
                 # Set TP/SL
-                entry_price = float(order['average']) if order['average'] else close_price
-                sl_price = entry_price + sl_dist
-                tp_price = entry_price - (sl_dist * config.RISK_REWARD_RATIO)
+                # entry_price = float(order['average']) if order['average'] else close_price
                 
                 # Stop Loss
                 self.exchange.create_order(self.symbol, 'STOP_MARKET', 'buy', amount, None, {
@@ -211,48 +222,184 @@ class BinanceBot:
         except Exception as e:
             print(f"❌ Trade Execution Error: {e}")
 
+    def get_account_status(self):
+        try:
+            balance = self.exchange.fetch_balance()
+            usdt_free = balance['USDT']['free']
+            usdt_total = balance['USDT']['total']
+            
+            # Fetch all positions to ensure we don't miss it due to symbol mismatch in filter
+            # CCXT might return 'BTC/USDT:USDT' for 'BTC/USDT'
+            positions = self.exchange.fetch_positions()
+            open_orders = self.exchange.fetch_open_orders(self.symbol)
+            
+            active_positions = []
+            for pos in positions:
+                # Check for symbol match (handling BTC/USDT vs BTC/USDT:USDT)
+                symbol_match = (pos['symbol'] == self.symbol) or (pos['symbol'] == f"{self.symbol}:USDT")
+                
+                if symbol_match and float(pos['contracts']) > 0:
+                    active_positions.append(pos)
+            
+            return {
+                'balance': usdt_free,
+                'total': usdt_total,
+                'positions': active_positions,
+                'orders': open_orders
+            }
+        except Exception as e:
+            print(f"❌ Error fetching account status: {e}")
+            return None
+
+    def cancel_all_orders(self):
+        try:
+            self.exchange.cancel_all_orders(self.symbol)
+            print("🗑️ All open orders cancelled.")
+        except Exception as e:
+            print(f"⚠️ Error cancelling orders: {e}")
+
+    def close_position(self, position):
+        try:
+            symbol = position['symbol']
+            amount = float(position['contracts'])
+            side = position['side']
+            
+            print(f"🔄 Closing {side.upper()} Position for Reversal...")
+            
+            if side == 'long':
+                self.exchange.create_market_sell_order(symbol, amount)
+            else:
+                self.exchange.create_market_buy_order(symbol, amount)
+                
+            print("✅ Position Closed.")
+            time.sleep(2)
+        except Exception as e:
+            print(f"❌ Error closing position: {e}")
+
     def run(self):
         print(f"🤖 Binance Bot Started | {self.symbol} | {self.timeframe}")
-        print("Waiting for next candle close...")
         
+        last_check_hour = -1
+
         while True:
             try:
-                # 1. Fetch Data
-                df = self.fetch_data()
-                if df is None:
-                    time.sleep(10)
-                    continue
-                
-                # 2. Calculate Signals
-                df = self.calculate_signals(df)
-                last_row = df.iloc[-2] # Use completed candle (index -2, as -1 is current forming candle)
-                current_price = last_row['close']
-                
-                # Log status
-                print(f"[{datetime.now()}] Price: {current_price} | Delta Z: {last_row['delta_z']:.2f} | SMA50: {last_row['sma50']:.2f}")
-                
-                # 3. Check Position
-                pos_side, pos_size, entry_price = self.get_position()
-                
-                if pos_size == 0:
-                    # No position, check for entry
-                    if last_row['delta_z'] > config.Z_SCORE_THRESHOLD and last_row['close'] > last_row['sma50']:
-                        print("🟢 LONG Signal Detected!")
-                        self.execute_trade('long', current_price, last_row['atr'])
-                        
-                    elif last_row['delta_z'] < -config.Z_SCORE_THRESHOLD and last_row['close'] < last_row['sma50']:
-                        print("🔴 SHORT Signal Detected!")
-                        self.execute_trade('short', current_price, last_row['atr'])
-                else:
-                    print(f"⚠️ Position Open: {pos_side.upper()} (Size: {pos_size}) - Waiting for TP/SL")
-
-                # Sleep logic - Wait until next hour
-                # Calculate time until next hour
                 now = datetime.now()
-                next_hour = now.replace(minute=0, second=0, microsecond=0) + pd.Timedelta(hours=1)
-                sleep_seconds = (next_hour - now).total_seconds() + 10  # Add 10 sec buffer
+                print(f"\n--- Status Check [{now.strftime('%Y-%m-%d %H:%M:%S')}] ---")
                 
-                print(f"⏳ Next check at {next_hour.strftime('%H:%M')} (sleeping {int(sleep_seconds)}s)")
+                # 1. Get Status
+                status = self.get_account_status()
+                active_positions = status['positions']
+                has_position = len(active_positions) > 0
+                
+                if status:
+                    print(f"💰 Balance: {status['balance']:.2f} USDT (Total: {status['total']:.2f})")
+                    
+                    if has_position:
+                        for pos in active_positions:
+                            side = pos['side']
+                            size = float(pos['contracts'])
+                            entry = float(pos['entryPrice'])
+                            pnl = float(pos['unrealizedPnl'])
+                            print(f"⚠️ Position: {side.upper()} | Size: {size} | Entry: {entry} | PnL: {pnl:.2f}")
+                        print("ℹ️ Position is OPEN. New signals will be ignored.")
+                    else:
+                        print("✅ No Open Position. Ready for signals (Long/Short).")
+                        
+                    orders = status['orders']
+                    print(f"📋 Open Orders: {len(orders)}")
+                    for o in orders:
+                        # For Stop/TP orders, 'price' might be None, so we check 'stopPrice'
+                        price = o.get('price')
+                        stop_price = o.get('stopPrice') or o.get('triggerPrice')
+                        
+                        if price is None or float(price) == 0:
+                            display_price = f"{stop_price} (Trigger)"
+                        else:
+                            display_price = price
+                            
+                        print(f"   - {o['type']} {o['side']} @ {display_price} ({o['status']})")
+                        
+                    # 2. Cleanup Logic: No Position but have Orders -> Cancel All
+                    if not has_position and len(orders) > 0:
+                        print("🧹 No position but orders found. Cleaning up...")
+                        self.cancel_all_orders()
+
+                # 3. Entry Logic (Only at minute 0)
+                if now.minute == 0 and now.hour != last_check_hour:
+                    last_check_hour = now.hour
+                    print("🕐 Hourly Check Triggered...")
+                    
+                    # Fetch Data
+                    df = self.fetch_data()
+                    if df is not None:
+                        # Calculate Signals
+                        df = self.calculate_signals(df)
+                        last_row = df.iloc[-2]
+                        current_price = last_row['close']
+                        
+                        print(f"📊 Market Data: Price: {current_price} | Delta Z: {last_row['delta_z']:.2f} | SMA50: {last_row['sma50']:.2f}")
+                        
+                        # Calculate Swing High/Low (Lookback 50)
+                        # df has current candle at -1 (forming), -2 (last closed)
+                        # We want last 50 closed candles: -52 to -2
+                        lookback_window = df.iloc[-52:-2]
+                        swing_low = lookback_window['low'].min()
+                        swing_high = lookback_window['high'].max()
+                        
+                        # Determine Signals
+                        long_signal = last_row['delta_z'] > config.Z_SCORE_THRESHOLD and last_row['close'] > last_row['sma50']
+                        short_signal = last_row['delta_z'] < -config.Z_SCORE_THRESHOLD and last_row['close'] < last_row['sma50']
+                        
+                        # Check for Reversal
+                        if has_position:
+                            for pos in active_positions:
+                                side = pos['side']
+                                if side == 'long' and short_signal:
+                                    print("🔄 Reversal Signal Detected (Long -> Short)!")
+                                    self.cancel_all_orders()
+                                    self.close_position(pos)
+                                    has_position = False
+                                    
+                                elif side == 'short' and long_signal:
+                                    print("🔄 Reversal Signal Detected (Short -> Long)!")
+                                    self.cancel_all_orders()
+                                    self.close_position(pos)
+                                    has_position = False
+
+                        if not has_position:
+                            if long_signal:
+                                print("🟢 LONG Signal Detected!")
+                                
+                                # SL = Swing Low
+                                sl_price = swing_low
+                                # Safety: If SL is above current price (impossible for min low) or too close
+                                if sl_price >= current_price: sl_price = current_price - last_row['atr']
+                                
+                                # TP = Entry + (Risk * 1.618)
+                                risk = current_price - sl_price
+                                tp_price = current_price + (risk * 1.618)
+                                
+                                self.execute_trade('long', current_price, sl_price, tp_price)
+                                
+                            elif short_signal:
+                                print("🔴 SHORT Signal Detected!")
+                                
+                                # SL = Swing High
+                                sl_price = swing_high
+                                # Safety
+                                if sl_price <= current_price: sl_price = current_price + last_row['atr']
+                                
+                                # TP = Entry - (Risk * 1.618)
+                                risk = sl_price - current_price
+                                tp_price = current_price - (risk * 1.618)
+                                
+                                self.execute_trade('short', current_price, sl_price, tp_price)
+                        else:
+                            print("ℹ️ Position remains open. No reversal signal.")
+                
+                # Sleep logic - Align to next minute
+                sleep_seconds = 60 - datetime.now().second
+                print(f"💤 Sleeping {sleep_seconds}s...")
                 time.sleep(sleep_seconds)
                 
             except KeyboardInterrupt:
